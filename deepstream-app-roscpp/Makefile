@@ -103,6 +103,7 @@ $(APP): $(OBJS) Makefile
 	$(CXX) -o $(APP) $(OBJS) $(LIBS)
 
 install: $(APP)
+	mkdir -p $(APP_INSTALL_DIR)
 	cp -rv $(APP) $(APP_INSTALL_DIR)
 
 clean:
