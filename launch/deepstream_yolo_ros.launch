@@ -1,0 +1,5 @@
+<launch>
+  <arg name="config" default="/home/ubuntu/deepstream_app_config.txt" />
+  <node pkg="deepstream_yolo_ros" type="deepstream-app-roscpp" name="deepstream_app_roscpp" output="screen" args="-c $(arg config)">
+  </node>
+</launch>
