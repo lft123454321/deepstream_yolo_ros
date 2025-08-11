@@ -67,11 +67,12 @@ SRCS+= $(wildcard apps-common/src/deepstream-yaml/*.cpp)
 
 INCS:= $(wildcard *.h)
 
-PKGS:= gstreamer-1.0 gstreamer-video-1.0 x11 json-glib-1.0
+PKGS:= gstreamer-1.0 gstreamer-video-1.0 x11 json-glib-1.0 gstreamer-app-1.0
 
 OBJS:= $(SRCS:.c=.o)
 OBJS:= $(OBJS:.cpp=.o)
 
+CFLAGS+= -g
 
 CFLAGS+= -I./ -I/opt/nvidia/deepstream/deepstream/sources/apps/apps-common/includes \
 		 -I/opt/nvidia/deepstream/deepstream/sources/includes -DDS_VERSION_MINOR=1 -DDS_VERSION_MAJOR=5 \

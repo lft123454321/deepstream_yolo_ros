@@ -256,6 +256,8 @@ void init_ros();
 
 void publishBoundingBoxes(AppCtx *appCtx, NvDsBatchMeta *batch_meta);
 
+void publishImage(AppCtx *appCtx, void *data);
+
 #ifdef __cplusplus
 }
 #endif

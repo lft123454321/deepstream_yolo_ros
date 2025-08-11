@@ -21,6 +21,7 @@
  */
 
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
@@ -827,53 +828,206 @@ done:
   return ret;
 }
 
-/**
- * Function to add components to pipeline which are dependent on number
- * of streams. These components work on single buffer. If tiling is being
- * used then single instance will be created otherwise < N > such instances
- * will be created for < N > streams
- */
+// appsink new-sample 回调，将原始图像发布为 ROS 图像消息
+static GstFlowReturn on_new_sample_ros_publish(GstElement *appsink, gpointer user_data)
+{
+    AppCtx *appCtx = (AppCtx *)user_data;
+    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
+    if (!sample) return GST_FLOW_OK;
+    // 直接将 sample 传递给 publishImage，后续可在 publishImage 内部解析 sample
+    publishImage(appCtx, sample);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
 static gboolean
-create_processing_instance (AppCtx * appCtx, guint index)
+create_ros_sink_sub_bin(NvDsSinkBinSubBin *bin, AppCtx *appCtx)
 {
   gboolean ret = FALSE;
-  NvDsConfig *config = &appCtx->config;
-  NvDsInstanceBin *instance_bin = &appCtx->pipeline.instance_bins[index];
-  GstElement *last_elem;
-  gchar elem_name[32];
-
-  instance_bin->index = index;
-  instance_bin->appCtx = appCtx;
-
-  g_snprintf (elem_name, 32, "processing_bin_%d", index);
-  instance_bin->bin = gst_bin_new (elem_name);
-
-  if (!create_sink_bin (config->num_sink_sub_bins,
-          config->sink_bin_sub_bin_config, &instance_bin->sink_bin, index)) {
+  bin->bin = gst_bin_new("ros_sink_sub_bin");
+  if(!bin->bin)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create element 'ros_sink_sub_bin'");
     goto done;
   }
 
-  gst_bin_add (GST_BIN (instance_bin->bin), instance_bin->sink_bin.bin);
-  last_elem = instance_bin->sink_bin.bin;
+  bin->queue = gst_element_factory_make(NVDS_ELEM_QUEUE, "ros_sink_sub_bin_queue");
+  if(!bin->queue)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create 'ros_sink_sub_bin_queue'");
+    goto done;
+  }
 
-  if (config->osd_config.enable) {
-    if (!create_osd_bin (&config->osd_config, &instance_bin->osd_bin)) {
+  bin->transform = gst_element_factory_make(NVDS_ELEM_VIDEO_CONV, "ros_sink_sub_bin_transform");
+  if(!bin->transform)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create 'ros_sink_sub_bin_transform'");
+    goto done;
+  }
+
+  bin->cap_filter = gst_element_factory_make("capsfilter", "ros_sink_sub_bin_cap_filter");
+  if(!bin->cap_filter)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create 'ros_sink_sub_bin_cap_filter'");
+    goto done;
+  }
+
+  bin->sink = gst_element_factory_make("appsink", "ros_image_sink");
+  if(!bin->sink)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create 'ros_image_sink'");
+    goto done;
+  }
+  g_object_set(bin->sink, "emit-signals", TRUE, "sync", FALSE, NULL);
+  // 设置 capsfilter 为 BGR 格式
+  GstCaps *caps = gst_caps_from_string("video/x-raw, format=BGRx");
+  if(!caps)
+  {
+    NVGSTDS_ERR_MSG_V("Failed to create caps for capsfilter!");
+    goto done;
+  }
+  g_object_set(bin->cap_filter, "caps", caps, NULL);
+  gst_caps_unref(caps);
+  // 添加元素到 bin
+  gst_bin_add_many(GST_BIN(bin->bin), bin->queue, bin->transform, bin->cap_filter, bin->sink, NULL);
+  // 连接 queue -> transform -> cap_filter -> appsink
+  NVGSTDS_LINK_ELEMENT(bin->queue, bin->transform);
+  NVGSTDS_LINK_ELEMENT(bin->transform, bin->cap_filter);
+  NVGSTDS_LINK_ELEMENT(bin->cap_filter, bin->sink);
+
+  NVGSTDS_BIN_ADD_GHOST_PAD(bin->bin, bin->queue, "sink");
+  // appsink 回调，发布 ROS 图像
+  g_signal_connect(bin->sink, "new-sample", G_CALLBACK(on_new_sample_ros_publish), appCtx);
+
+  ret = TRUE;
+done:
+  if (!ret)
+  {
+    NVGSTDS_ERR_MSG_V("%s failed", __func__);
+  }
+  return ret;
+}
+
+  gboolean
+  create_ros_sink_bin(guint num_sub_bins, NvDsSinkSubBinConfig * config_array,
+                      NvDsSinkBin * bin, guint index, AppCtx * appCtx)
+  {
+    gboolean ret = FALSE;
+    guint i;
+
+    bin->bin = gst_bin_new("ros_sink_bin");
+    if (!bin->bin)
+    {
+      NVGSTDS_ERR_MSG_V("Failed to create element 'ros_sink_bin'");
       goto done;
     }
 
-    gst_bin_add (GST_BIN (instance_bin->bin), instance_bin->osd_bin.bin);
+    bin->queue = gst_element_factory_make(NVDS_ELEM_QUEUE, "sink_bin_queue");
+    if (!bin->queue)
+    {
+      NVGSTDS_ERR_MSG_V("Failed to create element 'sink_bin_queue'");
+      goto done;
+    }
 
-    NVGSTDS_LINK_ELEMENT (instance_bin->osd_bin.bin, last_elem);
+    gst_bin_add(GST_BIN(bin->bin), bin->queue);
 
-    last_elem = instance_bin->osd_bin.bin;
+    NVGSTDS_BIN_ADD_GHOST_PAD(bin->bin, bin->queue, "sink");
+
+    bin->tee = gst_element_factory_make(NVDS_ELEM_TEE, "sink_bin_tee");
+    if (!bin->tee)
+    {
+      NVGSTDS_ERR_MSG_V("Failed to create element 'sink_bin_tee'");
+      goto done;
+    }
+
+    gst_bin_add(GST_BIN(bin->bin), bin->tee);
+
+    NVGSTDS_LINK_ELEMENT(bin->queue, bin->tee);
+
+    if(!create_ros_sink_sub_bin(&bin->sub_bins[0], appCtx))
+    {
+      NVGSTDS_ERR_MSG_V("Failed to create 'ros_sink_sub_bin'");
+      goto done;
+    }
+    gst_bin_add(GST_BIN(bin->bin), bin->sub_bins[0].bin);
+    if(!link_element_to_tee_src_pad(bin->tee, bin->sub_bins[0].bin))
+    {
+      NVGSTDS_ERR_MSG_V("Failed to link 'ros_sink_sub_bin'");
+      goto done;
+    }
+    bin->num_bins = 1;
+
+    ret = TRUE;
+  done:
+    if (!ret)
+    {
+      NVGSTDS_ERR_MSG_V("%s failed", __func__);
+    }
+    return ret;
   }
 
-  NVGSTDS_BIN_ADD_GHOST_PAD (instance_bin->bin, last_elem, "sink");
-  if (config->osd_config.enable) {
-    NVGSTDS_ELEM_ADD_PROBE (instance_bin->all_bbox_buffer_probe_id,
-        instance_bin->osd_bin.nvosd, "sink",
-        gie_processing_done_buf_prob, GST_PAD_PROBE_TYPE_BUFFER, instance_bin);
-  } else {
+  /**
+   * Function to add components to pipeline which are dependent on number
+   * of streams. These components work on single buffer. If tiling is being
+   * used then single instance will be created otherwise < N > such instances
+   * will be created for < N > streams
+   */
+  static gboolean
+  create_processing_instance(AppCtx * appCtx, guint index)
+  {
+    gboolean ret = FALSE;
+    NvDsConfig *config = &appCtx->config;
+    NvDsInstanceBin *instance_bin = &appCtx->pipeline.instance_bins[index];
+    GstElement *last_elem;
+    gchar elem_name[32];
+
+    instance_bin->index = index;
+    instance_bin->appCtx = appCtx;
+
+    g_snprintf(elem_name, 32, "processing_bin_%d", index);
+    instance_bin->bin = gst_bin_new(elem_name);
+
+    // 判断 sink group 的类型
+    if (config->sink_bin_sub_bin_config[index].type == 7)
+    {
+      if (!create_ros_sink_bin(config->num_sink_sub_bins,
+                               config->sink_bin_sub_bin_config, 
+                               &instance_bin->sink_bin, index, appCtx))
+      {
+        goto done;
+      }
+    }
+    // 其它类型走原有流程
+    else if (!create_sink_bin(config->num_sink_sub_bins,
+                              config->sink_bin_sub_bin_config, &instance_bin->sink_bin, index))
+    {
+      goto done;
+    }
+
+    gst_bin_add(GST_BIN(instance_bin->bin), instance_bin->sink_bin.bin);
+    last_elem = instance_bin->sink_bin.bin;
+
+    if (config->osd_config.enable)
+    {
+      if (!create_osd_bin(&config->osd_config, &instance_bin->osd_bin))
+      {
+        goto done;
+      }
+
+      gst_bin_add(GST_BIN(instance_bin->bin), instance_bin->osd_bin.bin);
+
+      NVGSTDS_LINK_ELEMENT(instance_bin->osd_bin.bin, last_elem);
+
+      last_elem = instance_bin->osd_bin.bin;
+    }
+
+    NVGSTDS_BIN_ADD_GHOST_PAD(instance_bin->bin, last_elem, "sink");
+    if (config->osd_config.enable)
+    {
+      NVGSTDS_ELEM_ADD_PROBE(instance_bin->all_bbox_buffer_probe_id,
+                             instance_bin->osd_bin.nvosd, "sink",
+                             gie_processing_done_buf_prob, GST_PAD_PROBE_TYPE_BUFFER, instance_bin);
+    } else {
     NVGSTDS_ELEM_ADD_PROBE (instance_bin->all_bbox_buffer_probe_id,
         instance_bin->sink_bin.bin, "sink",
         gie_processing_done_buf_prob, GST_PAD_PROBE_TYPE_BUFFER, instance_bin);
@@ -1527,8 +1681,7 @@ destroy_pipeline (AppCtx * appCtx)
     }
   } else if (appCtx->pipeline.instance_bins[0].sink_bin.bin) {
     GstPad *gstpad =
-        gst_element_get_static_pad (appCtx->pipeline.instance_bins[0].sink_bin.
-        bin, "sink");
+        gst_element_get_static_pad(appCtx->pipeline.instance_bins[0].sink_bin.bin, "sink");
     gst_pad_send_event (gstpad, gst_event_new_eos ());
     gst_object_unref (gstpad);
   }

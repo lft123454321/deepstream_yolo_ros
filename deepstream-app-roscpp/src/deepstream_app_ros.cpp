@@ -2,10 +2,12 @@
 #include <deepstream_yolo_ros/MultiCamResult.h>
 #include <deepstream_yolo_ros/BoundingBoxes.h>
 #include <deepstream_yolo_ros/BoundingBox.h>
+#include <sensor_msgs/Image.h>
 #include "deepstream_app.h"
 
 ros::NodeHandle *nh;
 ros::Publisher multi_cam_result_pub;
+ros::Publisher image_pub;
 
 int frame_count = 0;
 
@@ -15,6 +17,7 @@ void init_ros()
     ros::init(argc, nullptr, "deepstream_yolo_ros_node");
     nh = new ros::NodeHandle("~");
     multi_cam_result_pub = nh->advertise<deepstream_yolo_ros::MultiCamResult>("yolo_result", 10);
+    image_pub = nh->advertise<sensor_msgs::Image>("yolo_image", 10);
 }
 
 void publishBoundingBoxes(AppCtx *appCtx, NvDsBatchMeta *batch_meta)
@@ -53,4 +56,63 @@ void publishBoundingBoxes(AppCtx *appCtx, NvDsBatchMeta *batch_meta)
     if(frame_count % (interval + 1) == 0)
         multi_cam_result_pub.publish(multi_cam_result_msg);
     ++frame_count;
+}
+
+void publishImage(AppCtx *appCtx, void *data)
+{
+    // data 是 GstSample*
+    GstSample *sample = (GstSample *)data;
+    if (!sample) return;
+
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+
+    // 获取图像参数
+    int width = 0, height = 0;
+    const char *format = gst_structure_get_string(s, "format");
+    gst_structure_get_int(s, "width", &width);
+    gst_structure_get_int(s, "height", &height);
+
+    // 支持 BGR/BGRx/RGBA/RGB 格式
+    sensor_msgs::Image img_msg;
+    img_msg.header.stamp = ros::Time::now();
+    img_msg.width = width;
+    img_msg.height = height;
+    img_msg.is_bigendian = false;
+
+    int channels = 3;
+    if (format) {
+        if (strcmp(format, "BGR") == 0) {
+            img_msg.encoding = "bgr8";
+            channels = 3;
+        } else if (strcmp(format, "RGB") == 0) {
+            img_msg.encoding = "rgb8";
+            channels = 3;
+        } else if (strcmp(format, "BGRx") == 0) {
+            img_msg.encoding = "bgra8";
+            channels = 4;
+        } else if (strcmp(format, "RGBA") == 0) {
+            img_msg.encoding = "rgba8";
+            channels = 4;
+        } else {
+            // 未知格式，默认按3通道处理
+            img_msg.encoding = "rgb8";
+            channels = 3;
+        }
+    } else {
+        img_msg.encoding = "rgb8";
+        channels = 3;
+    }
+    img_msg.step = width * channels;
+
+    // 拷贝数据
+    GstMapInfo map;
+    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        img_msg.data.resize(map.size);
+        memcpy(&img_msg.data[0], map.data, map.size);
+        gst_buffer_unmap(buffer, &map);
+    }
+
+    image_pub.publish(img_msg);
 }
